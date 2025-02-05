@@ -52,11 +52,17 @@ def get_cifar10_loaders(batch_size=96, num_workers=2, cutout_length=16):
     # Download CIFAR-10 datasets if needed
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
     valset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_val)
+    
+    # On Windows, force num_workers to 0
+    if os.name == "nt":
+        train_workers = 0
+        val_workers = 0
+    else:
+        train_workers = num_workers
+        val_workers = num_workers
 
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True,
-                                               num_workers=num_workers, pin_memory=True)
-    # On Windows, set num_workers for the validation loader to 0 to avoid multiprocessing issues.
-    val_workers = 0 if os.name == "nt" else num_workers
+                                               num_workers=train_workers, pin_memory=True)
     val_loader = torch.utils.data.DataLoader(valset, batch_size=batch_size, shuffle=False,
                                              num_workers=val_workers, pin_memory=True)
     return train_loader, val_loader
