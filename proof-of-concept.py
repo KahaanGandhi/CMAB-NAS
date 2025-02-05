@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 CMAB-NAS via NMCS for CIFAR-10
   1. CIFAR-10 data loading
@@ -54,8 +55,10 @@ def get_cifar10_loaders(batch_size=96, num_workers=2, cutout_length=16):
 
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True,
                                                num_workers=num_workers, pin_memory=True)
+    # On Windows, set num_workers for the validation loader to 0 to avoid multiprocessing issues.
+    val_workers = 0 if os.name == "nt" else num_workers
     val_loader = torch.utils.data.DataLoader(valset, batch_size=batch_size, shuffle=False,
-                                             num_workers=num_workers, pin_memory=True)
+                                             num_workers=val_workers, pin_memory=True)
     return train_loader, val_loader
 
 class CutoutDefault(object):
@@ -456,6 +459,7 @@ class NMCSNAS:
         self.proxy.eval()
         correct = 0
         total = 0
+        # Use the validation loader; on Windows num_workers will be 0 (see get_cifar10_loaders)
         val_iter = iter(self.val_loader)
         with torch.no_grad():
             for _ in range(num_batches):
@@ -511,7 +515,7 @@ class NMCSNAS:
                 self.nmcs_normal.record_reward(arch_n, reward)
                 self.nmcs_reduce.record_reward(arch_r, reward)
 
-            # TODO: make decay a function of epoch
+            # Decay the exploration parameter
             self.nmcs_normal.alpha *= 0.95
             self.nmcs_reduce.alpha *= 0.95
 
@@ -614,7 +618,7 @@ class FinalCell(nn.Module):
         else:
             C_out = self.preprocess.bn.num_features
         op_mod = create_op(op_name, in_ch, C_out, stride=stride)
-        op_mod = op_mod.to(x.device)
+        op_mod = op_mod.to(x.device)  # Ensure the operator is on the same device as x
         return op_mod(x)
 
 # ====== Evaluation & Final Training ======
@@ -634,7 +638,7 @@ def evaluate(model, loader, device):
 
 def train_final_model(arch_normal, arch_reduce, device='cuda',
                       lr=0.025, momentum=0.9, weight_decay=3e-4,
-                      epochs=25, batch_size=96):
+                      epochs=650, batch_size=96):
     """
     Train the discovered architecture from scratch on CIFAR-10.
     """
@@ -701,7 +705,7 @@ def main():
         lr=0.025,
         momentum=0.9,
         weight_decay=3e-4,
-        epochs=50,  # 2 for testing, increase to 10+ for full search
+        epochs=50,
         batch_size=96
     )
 
@@ -719,7 +723,7 @@ def main():
         arch_normal=best_arch_normal,
         arch_reduce=best_arch_reduce,
         device=device,
-        epochs=100,
+        epochs=650,
         batch_size=96
     )
     print(f"[Main] Final discovered architecture accuracy on CIFAR-10: {final_acc:.2f}%")
