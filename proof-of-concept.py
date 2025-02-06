@@ -313,6 +313,7 @@ class LocalMAB:
                     for op2 in self.operations:
                         if i1 == i2 and op1 == op2:
                             continue
+                        # Canonical ordering
                         if (i1 < i2) or (i1 == i2 and op1 < op2):
                             self.arms.append(((i1, op1), (i2, op2)))
 
@@ -323,7 +324,7 @@ class LocalMAB:
             n_j = rec['num_plays']
             if n_j == 0:
                 avg_r = 0.0
-                bonus = 1e6  # force exploration
+                bonus = 1e6  # Force exploration
             else:
                 avg_r = rec['total_reward'] / n_j
                 bonus = alpha * math.sqrt(2.0 * math.log(self.num_plays_global + 1e-12) / (n_j + 1e-12))
@@ -391,11 +392,12 @@ class NMCSNAS:
     
     The search process:
       1. Warms up the proxy network using random sampling.
-      2. For each search epoch, samples B child architectures, trains for one mini-batch,
-         evaluates on a few validation batches, and backpropagates the reward.
+      2. For each search epoch, runs a simulation loop (L iterations) to update the local MAB rewards,
+         then samples B child architectures, trains for one mini-batch, evaluates on a few validation batches,
+         and backpropagates the reward.
     """
     def __init__(self, device, alpha=1.0, lr=0.025, momentum=0.9,
-                 weight_decay=3e-4, epochs=10, batch_size=96):
+                 weight_decay=3e-4, epochs=50, batch_size=96):
         self.device = device
         self.alpha = alpha
         self.epochs = epochs
@@ -465,7 +467,6 @@ class NMCSNAS:
         self.proxy.eval()
         correct = 0
         total = 0
-        # Use the validation loader; on Windows num_workers will be 0 (see get_cifar10_loaders)
         val_iter = iter(self.val_loader)
         with torch.no_grad():
             for _ in range(num_batches):
@@ -497,12 +498,23 @@ class NMCSNAS:
         if not self.warmup_done:
             self._warmup_proxy(warmup_epochs)
 
+        # Simulation loop length (L iterations) to update the local MAB rewards
+        L = 8
+
         train_iter = iter(self.train_loader)
         # Outer loop: for each search epoch
         for ep in range(self.epochs):
             self.current_epoch = ep
             print(f"\n=== Search Epoch {ep+1}/{self.epochs} ===")
             print(f"  (Normal alpha: {self.nmcs_normal.alpha:.3f}, Reduction alpha: {self.nmcs_reduce.alpha:.3f})")
+
+            # Run simulation iterations to update the reward distribution
+            for sim in range(L):
+                sim_arch_n = self.nmcs_normal.sample_architecture_ucb()
+                sim_arch_r = self.nmcs_reduce.sample_architecture_ucb()
+                sim_reward = self._eval_child_architecture(sim_arch_n, sim_arch_r, num_batches=1)
+                self.nmcs_normal.record_reward(sim_arch_n, sim_reward)
+                self.nmcs_reduce.record_reward(sim_arch_r, sim_reward)
 
             candidate_normal = []
             candidate_reduce = []
@@ -644,7 +656,7 @@ def evaluate(model, loader, device):
 
 def train_final_model(arch_normal, arch_reduce, device='cuda',
                       lr=0.025, momentum=0.9, weight_decay=3e-4,
-                      epochs=650, batch_size=96):
+                      epochs=800, batch_size=96):
     """
     Train the discovered architecture from scratch on CIFAR-10.
     """
@@ -724,12 +736,12 @@ def main():
     print("[Main] Best Reduction Cell Discovered:")
     print(best_arch_reduce)
 
-    # Train the final discovered architecture from scratch
+    # Train the final discovered architecture from scratch for 800 epochs
     final_acc = train_final_model(
         arch_normal=best_arch_normal,
         arch_reduce=best_arch_reduce,
         device=device,
-        epochs=650,
+        epochs=800,
         batch_size=96
     )
     print(f"[Main] Final discovered architecture accuracy on CIFAR-10: {final_acc:.2f}%")
