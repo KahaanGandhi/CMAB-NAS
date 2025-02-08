@@ -516,6 +516,7 @@ class NMCSNAS:
                 self.nmcs_normal.record_reward(sim_arch_n, sim_reward)
                 self.nmcs_reduce.record_reward(sim_arch_r, sim_reward)
 
+            # Sample B child architectures
             candidate_normal = []
             candidate_reduce = []
             for _ in range(B):
@@ -728,7 +729,7 @@ def main():
     )
 
     # Run the search phase
-    best_arch_normal, best_arch_reduce = nmcs_nas.search(B=500, warmup_epochs=5)
+    best_arch_normal, best_arch_reduce = nmcs_nas.search(B=2500, warmup_epochs=5)
 
     # Display the discovered architectures
     print("\n[Main] Best Normal Cell Discovered:")

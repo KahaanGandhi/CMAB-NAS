@@ -1,5 +1,26 @@
+#!/usr/bin/env python3
 """
 Bandit-based NAS for Vision Transformers on CIFAR-10
+
+This implementation adapts the CMAB-NAS framework (as in Huang et al.)
+to search for transformer cell configurations on CIFAR-10.
+Key differences from the original CNN implementation include:
+  - Transformer-specific building blocks:
+      * Self-attention candidates: "global", "window", "shifted_window"
+      * Feed-forward (FFN) candidates: "ffn_2", "ffn_4", "ffn_8"
+  - A patch embedding layer with patch size 4 and embedding dimension 192,
+    based on recent literature that shows these settings work well on CIFAR-10.
+  - Pre-norm transformer cells with residual connections and dropout.
+  - Enhanced data augmentation (RandAugment, Cutout, RandomErasing) suited for transformers.
+  - Optimizer: AdamW (lr=0.001, weight_decay=0.05) with cosine annealing scheduler.
+  - Gradient clipping is applied during final training for stability.
+  - The NMCS framework uses a UCB-based bandit per cell to select a tuple
+    (attention, FFN) configuration, with a decaying exploration parameter.
+  - A lightweight proxy network (8 cells) is used for search, and the best
+    discovered configuration is transferred to a final network (20 cells).
+
+Reference: "Neural Architecture Search via Combinatorial Multi-Armed Bandit"
+(Huang et al., 2021) :contentReference[oaicite:0]{index=0}
 """
 
 import os, random, math, copy, time
@@ -13,14 +34,13 @@ import torch.backends.cudnn as cudnn
 import torchvision
 import torchvision.transforms as transforms
 
-# ====== Enhanced CIFAR-10 Data Loading ======
+# ====== Enhanced CIFAR-10 Data Loading with Strong Augmentation ======
 
 def get_cifar10_loaders(batch_size=96, num_workers=2, cutout_length=16):
-    # CIFAR-10 mean/std
     mean = (0.49139968, 0.48215827, 0.44653124)
     std  = (0.24703233, 0.24348505, 0.26158768)
-
-    # Enhanced training transforms: RandAugment, random crop, horizontal flip, tensor conversion, normalization, Cutout, and RandomErasing.
+    
+    # Training augmentations: random crop, horizontal flip, RandAugment, normalization, Cutout and RandomErasing.
     transform_train_list = [
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -31,18 +51,16 @@ def get_cifar10_loaders(batch_size=96, num_workers=2, cutout_length=16):
     if cutout_length > 0:
         transform_train_list.append(CutoutDefault(cutout_length))
     transform_train = transforms.Compose(transform_train_list)
-    
-    # Add RandomErasing as additional augmentation
     transform_train = transforms.Compose([
         transform_train,
         transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0)
     ])
-
+    
     transform_val = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
-
+    
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
     valset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_val)
     
@@ -74,14 +92,14 @@ class CutoutDefault(object):
         img[:, y1:y2, x1:x2] = 0.0
         return img
 
-# ====== Candidate Lists for Transformer Search Space ======
+# ====== Transformer Search Space Candidate Lists ======
 
 CANDIDATE_ATTN = ["global", "window", "shifted_window"]
 CANDIDATE_FFN = ["ffn_2", "ffn_4", "ffn_8"]
 
 # ====== Transformer Candidate Operations ======
 
-# Global Self-Attention using PyTorch's MultiheadAttention
+# Global Self-Attention using nn.MultiheadAttention (batch_first=True)
 class GlobalSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super(GlobalSelfAttention, self).__init__()
@@ -90,7 +108,7 @@ class GlobalSelfAttention(nn.Module):
         attn_out, _ = self.mha(x, x, x)
         return attn_out
 
-# Windowed Self-Attention: partitions tokens into non-overlapping windows
+# Windowed Self-Attention: partition tokens into non-overlapping windows
 class WindowSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, window_size=4, dropout=0.1):
         super(WindowSelfAttention, self).__init__()
@@ -110,7 +128,7 @@ class WindowSelfAttention(nn.Module):
         attn_out = attn_out.permute(0,1,3,2,4,5).contiguous().view(B, H*W, E)
         return attn_out
 
-# Shifted Window Self-Attention: applies a cyclic shift before window partitioning
+# Shifted Window Self-Attention: applies cyclic shift before window partitioning
 class ShiftedWindowSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, window_size=4, shift_size=None, dropout=0.1):
         super(ShiftedWindowSelfAttention, self).__init__()
@@ -171,31 +189,33 @@ def create_ffn_op(name, embed_dim, dropout=0.1):
     else:
         raise ValueError(f"Unknown FFN candidate: {name}")
 
-# ====== Mixed Transformer Cell ======
+# ====== Mixed Transformer Cell (Pre-Norm Residual Block) ======
 
 class MixedTransformerCell(nn.Module):
     def __init__(self, embed_dim, dropout=0.1):
         super(MixedTransformerCell, self).__init__()
         self.embed_dim = embed_dim
-        # Pre-norm structure as in ViT/DeiT
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
-        # Instantiate candidate operations (weight sharing among candidates)
+        # Candidate self-attention operations (weight-sharing)
         self.attn_ops = nn.ModuleDict({
             key: create_attn_op(key, embed_dim, num_heads=8, dropout=dropout) for key in CANDIDATE_ATTN
         })
+        # Candidate FFN operations
         self.ffn_ops = nn.ModuleDict({
             key: create_ffn_op(key, embed_dim, dropout=dropout) for key in CANDIDATE_FFN
         })
         self.dropout = nn.Dropout(dropout)
     def forward(self, x, arch):
-        # arch: tuple (attn_choice, ffn_choice)
+        # Ensure arch is a tuple (attn_choice, ffn_choice); if provided as list, take first tuple.
+        if isinstance(arch, (list, tuple)) and (not isinstance(arch[0], str)):
+            arch = arch[0]
         attn_choice, ffn_choice = arch
-        # Self-Attention block
+        # Self-Attention sub-block (pre-norm)
         x_norm = self.norm1(x)
         attn_out = self.attn_ops[attn_choice](x_norm)
         x = x + self.dropout(attn_out)
-        # FFN block
+        # FFN sub-block (pre-norm)
         x_norm = self.norm2(x)
         ffn_out = self.ffn_ops[ffn_choice](x_norm)
         x = x + self.dropout(ffn_out)
@@ -205,7 +225,7 @@ class MixedTransformerCell(nn.Module):
 
 class LocalMAB_Transformer:
     """
-    Each arm is a tuple (attn_choice, ffn_choice).
+    Local multi-armed bandit: each arm is a tuple (attn_choice, ffn_choice).
     """
     def __init__(self, candidate_attn, candidate_ffn):
         self.arms = []
@@ -259,7 +279,7 @@ class NMCSCellSearch_Transformer:
             arch.append(mab.arms[idx])
         return arch
     def record_reward(self, arch, reward):
-        share = reward / (self.num_cells)
+        share = reward / self.num_cells
         for i, arm in enumerate(arch):
             self.local_mabs[i].record_reward(arm, share)
     def best_architecture_local_optimal(self):
@@ -279,7 +299,7 @@ class ProxyTransformerNetwork(nn.Module):
         self.embed_dim = embed_dim
         self.depth = depth
         self.num_patches = (img_size // patch_size) ** 2
-        # Patch embedding layer (conv layer with kernel and stride equal to patch_size)
+        # Patch embedding layer: a conv layer with kernel/stride equal to patch_size
         self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         self.dropout = nn.Dropout(0.1)
@@ -288,18 +308,18 @@ class ProxyTransformerNetwork(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes)
     def forward(self, x, arch_config):
-        # arch_config: list of length 'depth' with a tuple (attn_choice, ffn_choice) for each cell
+        # arch_config: list of length 'depth' with a tuple (attn_choice, ffn_choice) per cell
         B = x.size(0)
-        x = self.patch_embed(x)  # (B, embed_dim, H, W)
+        x = self.patch_embed(x)   # (B, embed_dim, H, W)
         x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
         x = x + self.pos_embed
         x = self.dropout(x)
         for i, cell in enumerate(self.cells):
-            # Use corresponding cell configuration; default to ("global", "ffn_4") if None
+            # Use the i-th configuration; if not provided, default to ("global", "ffn_4")
             cell_arch = arch_config[i] if arch_config is not None else ("global", "ffn_4")
             x = cell(x, cell_arch)
         x = self.norm(x)
-        # Mean pooling over tokens
+        # Global average pooling over tokens
         x = x.mean(dim=1)
         x = self.head(x)
         return x
@@ -308,8 +328,8 @@ class ProxyTransformerNetwork(nn.Module):
 
 class TransformerBanditNAS:
     """
-    Orchestrates the search for transformer cell configurations using bandit strategies.
-    Uses a NMCSCellSearch_Transformer (one per cell) and a weight-sharing ProxyTransformerNetwork.
+    Orchestrates transformer cell architecture search via bandit strategies.
+    Uses NMCSCellSearch_Transformer for local decisions and a weight-sharing proxy network.
     """
     def __init__(self, device, alpha=1.0, lr=0.001, weight_decay=0.05,
                  epochs=50, batch_size=96, depth=8):
@@ -369,6 +389,8 @@ class TransformerBanditNAS:
         logits = self.proxy(inputs, arch)
         loss = self.criterion(logits, targets)
         loss.backward()
+        # Apply gradient clipping for transformer stability
+        torch.nn.utils.clip_grad_norm_(self.proxy.parameters(), max_norm=5.0)
         self.optimizer.step()
         return train_iter
     def _eval_child_architecture(self, arch, num_batches=1):
@@ -400,16 +422,17 @@ class TransformerBanditNAS:
                 total += targets.size(0)
                 correct += pred.eq(targets).sum().item()
         return 100.0 * correct / total if total > 0 else 0.0
-    def search(self, B=200, warmup_epochs=5):
+    def search(self, B=2500, warmup_epochs=5):
+        # B: number of candidate child architectures per epoch.
         if not self.warmup_done:
             self._warmup_proxy(warmup_epochs)
-        L = 4  # simulation iterations to update MAB rewards
+        L = 8  # Simulation iterations to update local bandit rewards.
         train_iter = iter(self.train_loader)
         for ep in range(self.epochs):
             self.current_epoch = ep
             print(f"\n=== Search Epoch {ep+1}/{self.epochs} ===")
             print(f"  (Alpha: {self.nmcs_transformer.alpha:.3f})")
-            # Simulation loop: update rewards using mini-batch evaluations
+            # Simulation: update local rewards with short evaluations.
             for sim in range(L):
                 sim_arch = self.nmcs_transformer.sample_architecture_ucb()
                 sim_reward = self._eval_child_architecture(sim_arch, num_batches=1)
@@ -435,12 +458,13 @@ class TransformerBanditNAS:
         print(f"Best discovered architecture validation accuracy: {self.best_acc:.2f}%")
         return self.best_arch
 
-# ====== Final Discovered Architecture (Stand-Alone Transformer) ======
+# ====== Final Discovered Transformer Network ======
 
 class DiscoveredTransformerNetwork(nn.Module):
     """
     Stand-alone transformer network built from the best discovered cell configuration.
-    Uses 20 cells (each cell uses the best discovered configuration).
+    This final network uses 20 cells. For cells, we cycle through the discovered configuration
+    if the number of cells exceeds the proxy depth.
     """
     def __init__(self, img_size=32, patch_size=4, embed_dim=192, depth=20, num_classes=10, best_arch=None):
         super(DiscoveredTransformerNetwork, self).__init__()
@@ -448,7 +472,10 @@ class DiscoveredTransformerNetwork(nn.Module):
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.depth = depth
-        self.best_arch = best_arch if best_arch is not None else ("global", "ffn_4")
+        if best_arch is None:
+            self.best_arch = [("global", "ffn_4")] * 8  # default configuration if none discovered
+        else:
+            self.best_arch = best_arch  # best_arch is expected as a list from the search phase.
         self.num_patches = (img_size // patch_size) ** 2
         self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
@@ -458,12 +485,14 @@ class DiscoveredTransformerNetwork(nn.Module):
         self.head = nn.Linear(embed_dim, num_classes)
     def forward(self, x):
         B = x.size(0)
-        x = self.patch_embed(x)  # (B, embed_dim, H, W)
-        x = x.flatten(2).transpose(1,2)  # (B, num_patches, embed_dim)
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
         x = x + self.pos_embed
         x = self.dropout(x)
-        for cell in self.cells:
-            x = cell(x, self.best_arch)
+        # Cycle through best_arch if final depth > proxy depth.
+        for i, cell in enumerate(self.cells):
+            cell_arch = self.best_arch[i % len(self.best_arch)]
+            x = cell(x, cell_arch)
         x = self.norm(x)
         x = x.mean(dim=1)
         x = self.head(x)
@@ -484,12 +513,11 @@ def evaluate(model, loader, device):
             correct += pred.eq(targets).sum().item()
     return 100.0 * correct / total if total > 0 else 0.0
 
-def train_final_model(best_arch, device='cuda',
-                      lr=0.001, weight_decay=0.05,
-                      epochs=800, batch_size=96):
+def train_final_model(best_arch, device='cuda', lr=0.001, weight_decay=0.05,
+                      epochs=650, batch_size=96):
     """
     Train the final discovered transformer network from scratch on CIFAR-10.
-    Uses AdamW optimizer and cosine annealing scheduler.
+    Uses AdamW with cosine annealing and gradient clipping.
     """
     print("=== Training Final Discovered Architecture ===")
     train_loader, val_loader = get_cifar10_loaders(batch_size=batch_size, cutout_length=16)
@@ -510,6 +538,7 @@ def train_final_model(best_arch, device='cuda',
             logits = model(inputs)
             loss = criterion(logits, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             total_loss += loss.item() * inputs.size(0)
             _, pred = logits.max(1)
@@ -541,7 +570,7 @@ def main():
     else:
         print("Device: CPU")
     
-    # Create the TransformerBanditNAS orchestrator (proxy network depth = 8)
+    # Create the TransformerBanditNAS orchestrator (proxy network with 8 cells)
     transformer_nas = TransformerBanditNAS(
         device=device,
         alpha=1.0,
@@ -551,12 +580,12 @@ def main():
         batch_size=96,
         depth=8
     )
-    # Run the search phase
-    best_arch = transformer_nas.search(B=200, warmup_epochs=5)
+    # Run the search phase with B=2500 child candidates per epoch.
+    best_arch = transformer_nas.search(B=2500, warmup_epochs=5)
     print("\n[Main] Best Discovered Cell Configuration:")
     print(best_arch)
-    # Train the final discovered architecture from scratch for 800 epochs
-    final_acc = train_final_model(best_arch=best_arch, device=device, epochs=800, batch_size=96)
+    # Train the final discovered architecture from scratch for 650 epochs on CIFAR-10.
+    final_acc = train_final_model(best_arch=best_arch, device=device, epochs=650, batch_size=96)
     print(f"[Main] Final discovered architecture accuracy on CIFAR-10: {final_acc:.2f}%")
     end_time = time.time()
     total_runtime = end_time - start_time
