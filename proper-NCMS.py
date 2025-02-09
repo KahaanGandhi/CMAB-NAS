@@ -650,6 +650,10 @@ class NMCSNAS:
             self.nmcs_tree_normal.alpha = self.alpha
             self.nmcs_tree_reduce.alpha = self.alpha
 
+            # Additional simulation iterations (Algorithm 4) to fully expand the tree for best architecture selection
+            self.nmcs_tree_normal.simulate(lambda arch: self._eval_child_architecture(arch, cell_type='normal'), L=800)
+            self.nmcs_tree_reduce.simulate(lambda arch: self._eval_child_architecture(arch, cell_type='reduce'), L=800)
+
             # Select the best architecture from each tree (exploitation-only policy)
             arch_n_opt = self.nmcs_tree_normal.best_architecture()
             arch_r_opt = self.nmcs_tree_reduce.best_architecture()
