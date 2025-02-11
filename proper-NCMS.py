@@ -621,9 +621,9 @@ class NMCSNAS:
             print(f"  (NMCS alpha: {self.alpha:.3f})")
 
             # Run NMCS simulations to update the reward distributions in the trees
-            self.nmcs_tree_normal.simulate(lambda arch: self._eval_child_architecture(arch, cell_type='normal'),
+            self.nmcs_tree_normal.simulate(lambda arch: self._evaluate_architecture_for_nmcs(arch, cell_type='normal'),
                                              L=simulation_iters)
-            self.nmcs_tree_reduce.simulate(lambda arch: self._eval_child_architecture(arch, cell_type='reduce'),
+            self.nmcs_tree_reduce.simulate(lambda arch: self._evaluate_architecture_for_nmcs(arch, cell_type='reduce'),
                                            L=simulation_iters)
 
             # Sample B candidate architectures using the NMCS trees
@@ -651,8 +651,8 @@ class NMCSNAS:
             self.nmcs_tree_reduce.alpha = self.alpha
 
             # Additional simulation iterations (Algorithm 4) to fully expand the tree for best architecture selection
-            self.nmcs_tree_normal.simulate(lambda arch: self._eval_child_architecture(arch, cell_type='normal'), L=800)
-            self.nmcs_tree_reduce.simulate(lambda arch: self._eval_child_architecture(arch, cell_type='reduce'), L=800)
+            self.nmcs_tree_normal.simulate(lambda arch: self._evaluate_architecture_for_nmcs(arch, cell_type='normal'), L=800)
+            self.nmcs_tree_reduce.simulate(lambda arch: self._evaluate_architecture_for_nmcs(arch, cell_type='reduce'), L=800)
 
             # Select the best architecture from each tree (exploitation-only policy)
             arch_n_opt = self.nmcs_tree_normal.best_architecture()

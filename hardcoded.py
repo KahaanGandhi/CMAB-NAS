@@ -256,7 +256,6 @@ class MixedCell(nn.Module):
 
         s0 = self.preprocess(input_tensor)
         node_outputs = []
-        # Use stride=1 for node operations (the external input is already preprocessed appropriately)
         stride = 1
 
         def get_input(idx):
@@ -265,21 +264,11 @@ class MixedCell(nn.Module):
             (i1, op1), (i2, op2) = node_def
             x1 = get_input(i1)
             x2 = get_input(i2)
-            out1 = self._forward_op(x1, op1, stride)
-            out2 = self._forward_op(x2, op2, stride)
+            out1 = create_op(op1, x1.shape[1], s0.shape[1], stride=1).to(x1.device)(x1)
+            out2 = create_op(op2, x2.shape[1], s0.shape[1], stride=1).to(x2.device)(x2)
             node_out = out1 + out2
             node_outputs.append(node_out)
         return torch.cat(node_outputs, dim=1)
-
-    def _forward_op(self, x, op_name, stride):
-        in_ch = x.shape[1]
-        if isinstance(self.preprocess, nn.Sequential):
-            C_out = self.preprocess[1].out_channels
-        else:
-            C_out = self.preprocess.bn.num_features
-        op_mod = create_op(op_name, in_ch, C_out, stride=stride)
-        op_mod = op_mod.to(x.device)
-        return op_mod(x)
 
 # ====== NMCS Tree Search for a Single Cell ======
 
@@ -326,9 +315,6 @@ class NMCSCellTree:
         self.root = NMCSNode(level=0, node_index=0)
 
     def sample_architecture(self, use_exploration=True):
-        """
-        Starting from the root, descend the tree until a complete cell (4 decisions) is obtained.
-        """
         node = self.root
         arch = []
         while node.level < self.num_nodes:
@@ -358,9 +344,6 @@ class NMCSCellTree:
         return arch
 
     def rollout(self, partial_arch):
-        """
-        Given a partial architecture, randomly complete the cell.
-        """
         arch = partial_arch.copy()
         current_level = len(arch)
         while current_level < self.num_nodes:
@@ -371,9 +354,6 @@ class NMCSCellTree:
         return arch
 
     def backpropagate(self, arch, reward):
-        """
-        Traverse the tree along arch and update statistics.
-        """
         node = self.root
         node.visits += 1
         node.total_reward += reward
@@ -386,9 +366,6 @@ class NMCSCellTree:
                 break
 
     def simulate(self, eval_fn, L=8):
-        """
-        Perform L simulation iterations.
-        """
         for _ in range(L):
             node = self.root
             arch = []
@@ -424,9 +401,6 @@ class NMCSCellTree:
             self.backpropagate(arch, reward)
 
     def best_architecture(self):
-        """
-        Return the architecture corresponding to the best child decisions.
-        """
         arch = []
         node = self.root
         while node.level < self.num_nodes:
@@ -605,6 +579,7 @@ class NMCSNAS:
 
 # ====== Final Discovered Architecture (Stand-Alone) ======
 
+# Best architecture as given in the test description:
 NORMAL_CELL_ARCH = [
     ((-2, 'sep_conv_3x3'), (-1, 'sep_conv_5x5')),
     ((-2, 'dil_conv_5x5'), (-2, 'skip_connect')),
@@ -649,17 +624,20 @@ class FinalCell(nn.Module):
 
     def forward(self, inputs):
         # inputs is a tuple: (c_{k-2}, c_{k-1})
-        s0, s1 = inputs
-        s0 = self.preprocess0(s0)
-        s1 = self.preprocess1(s1)
+        s0 = self.preprocess0(inputs[0])
+        s1 = self.preprocess1(inputs[1])
         node_outputs = []
         def get_input(idx):
             if idx == -2:
-                return s0
+                ret = s0
             elif idx == -1:
-                return s1
+                ret = s1
             else:
-                return node_outputs[idx]
+                ret = node_outputs[idx]
+            # Ensure spatial sizes match s0 (the chosen baseline)
+            if ret.shape[2] != s0.shape[2] or ret.shape[3] != s0.shape[3]:
+                ret = nn.functional.interpolate(ret, size=(s0.shape[2], s0.shape[3]), mode='bilinear', align_corners=False)
+            return ret
         for (i1, op1), (i2, op2) in self.arch:
             x1 = get_input(i1)
             x2 = get_input(i2)
@@ -697,7 +675,6 @@ class DiscoveredNetwork(nn.Module):
             reduction = (i in reduction_positions)
             cell = FinalCell(c_prev0, c_prev1, init_channels, arch_reduce if reduction else arch_normal, reduction)
             self.cells.append(cell)
-            # Update for next cell: shift the inputs (as in DARTS)
             c_prev0, c_prev1 = c_prev1, init_channels * 4
         self.global_pooling = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Linear(c_prev1, num_classes)
@@ -781,7 +758,6 @@ def main():
         print("GPU Name:", torch.cuda.get_device_name(0))
     else:
         print("Device: CPU")
-    # Here we use the given best architectures for final training.
     print("Using the following best architectures for final training:")
     print("Normal Cell:", NORMAL_CELL_ARCH)
     print("Reduction Cell:", REDUCTION_CELL_ARCH)
