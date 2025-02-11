@@ -1,26 +1,6 @@
 #!/usr/bin/env python3
 """
 Bandit-based NAS for Vision Transformers on CIFAR-10
-
-This implementation adapts the CMAB-NAS framework (as in Huang et al.)
-to search for transformer cell configurations on CIFAR-10.
-Key differences from the original CNN implementation include:
-  - Transformer-specific building blocks:
-      * Self-attention candidates: "global", "window", "shifted_window"
-      * Feed-forward (FFN) candidates: "ffn_2", "ffn_4", "ffn_8"
-  - A patch embedding layer with patch size 4 and embedding dimension 192,
-    based on recent literature that shows these settings work well on CIFAR-10.
-  - Pre-norm transformer cells with residual connections and dropout.
-  - Enhanced data augmentation (RandAugment, Cutout, RandomErasing) suited for transformers.
-  - Optimizer: AdamW (lr=0.001, weight_decay=0.05) with cosine annealing scheduler.
-  - Gradient clipping is applied during final training for stability.
-  - The NMCS framework uses a UCB-based bandit per cell to select a tuple
-    (attention, FFN) configuration, with a decaying exploration parameter.
-  - A lightweight proxy network (8 cells) is used for search, and the best
-    discovered configuration is transferred to a final network (20 cells).
-
-Reference: "Neural Architecture Search via Combinatorial Multi-Armed Bandit"
-(Huang et al., 2021) :contentReference[oaicite:0]{index=0}
 """
 
 import os, random, math, copy, time
