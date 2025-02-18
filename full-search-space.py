@@ -169,13 +169,11 @@ class SepConv(nn.Module):
 
 # ====== Mixed Cell (Proxy) for Weight-Sharing ======
 
-
 class MixedCell(nn.Module):
     """
-    A cell composed of 4 nodes.
-    Each node takes inputs from:
-      - Two external cell inputs (indices -2 and -1)
-      - All preceding node outputs (indices 0 to node_index-1)
+    A cell composed of 4 nodes. Each node takes inputs from:
+    - Two external cell inputs (indices -2 and -1)
+    - All preceding node outputs (indices 0 to node_index-1)
     """
     def __init__(self, c_in, c_out, reduction=False):
         super(MixedCell, self).__init__()
@@ -236,13 +234,11 @@ class MixedCell(nn.Module):
         return op_mod(x)
 
 # ====== Proxy Network with Two External Inputs per Cell ======
+# A weight-sharing network that stacks 8 cells.
+# For the first cell, the stem output is duplicated.
+# The network now updates the two previous cell outputs in a rolling fashion.
 
 class ProxyNetwork(nn.Module):
-    """
-    A weight-sharing network that stacks 8 cells.
-    Each cell now receives two external inputs from the two previous cells.
-    For the first cell, the stem output is duplicated.
-    """
     def __init__(self, C_in=3, num_classes=10, num_cells=8, init_channels=16):
         super(ProxyNetwork, self).__init__()
         self._num_cells = num_cells
@@ -256,6 +252,7 @@ class ProxyNetwork(nn.Module):
 
         # Build cells; reduction cells at indices 2 and 5
         self.cells = nn.ModuleList()
+        # For the first cell, c_in is init_channels; subsequent cells use the output channels of the previous cell
         c_prev = init_channels
         for i in range(num_cells):
             reduction = (i in [2, 5])
@@ -267,24 +264,25 @@ class ProxyNetwork(nn.Module):
         self.classifier = nn.Linear(c_prev, num_classes)
 
     def forward(self, x, arch_normal=None, arch_reduce=None):
-        s0 = self.stem(x)
-        # For the first cell, duplicate stem output for both external inputs
-        outs = [s0, s0]
+        s = self.stem(x)  # stem output
+        # For the first cell, duplicate the stem output for both external inputs
+        s0 = s
+        s1 = s
+        # For each cell, update s0 and s1 in a rolling manner
         for cell in self.cells:
             if cell.reduction:
-                # If no reduction architecture is provided, use a default (all skip connections)
                 arch = arch_reduce if arch_reduce is not None else [((-2, 'skip_connect'), (-1, 'skip_connect'))] * cell.num_nodes
-                out = cell(outs[-2], outs[-1], arch)
             else:
                 arch = arch_normal if arch_normal is not None else [((-2, 'skip_connect'), (-1, 'skip_connect'))] * cell.num_nodes
-                out = cell(outs[-2], outs[-1], arch)
-            outs.append(out)
-        final_out = outs[-1]
+            out = cell(s0, s1, arch)
+            s0, s1 = s1, out  # roll the previous two outputs
+        final_out = s1
         final_out = self.global_pooling(final_out)
         logits = self.classifier(final_out.view(final_out.size(0), -1))
         return logits
 
 # ====== NMCS Tree Search for a Single Cell (Updated for Two External Inputs) ======
+# The NMCS node valid inputs are now [-2, -1] plus previous node outputs.
 
 class NMCSNode:
     def __init__(self, level, node_index):
@@ -581,7 +579,7 @@ class NMCSNAS:
         total = 0
         val_iter = iter(self.val_loader)
         with torch.no_grad():
-            for _ in range(1):  # one batch for speed (TODO: check this)
+            for _ in range(1):  # one batch for speed (as in the paper's intent for a quick evaluation)
                 try:
                     inputs, targets = next(val_iter)
                 except StopIteration:
@@ -655,12 +653,11 @@ class NMCSNAS:
         return self.best_arch_normal, self.best_arch_reduce
 
 # ====== Final Discovered Architecture (Stand-Alone) ======
+# A stand-alone network built from discovered cells.
+# It stacks 20 cells (with reduction cells at roughly 1/3 and 2/3 of the depth)
+# Each cell takes two external inputs from the two previous cells, updated in a rolling fashion.
 
 class FinalCell(nn.Module):
-    """
-    Final cell for the stand-alone network.
-    Accepts two external inputs and uses a provided cell architecture.
-    """
     def __init__(self, c_in, c_out, arch, reduction=False):
         super(FinalCell, self).__init__()
         self.reduction = reduction
@@ -713,11 +710,6 @@ class FinalCell(nn.Module):
         return op_mod(x)
 
 class DiscoveredNetwork(nn.Module):
-    """
-    Stand-alone network built from discovered cells.
-    It stacks 20 cells (with reduction cells at roughly 1/3 and 2/3 of the depth).
-    Each cell takes two external inputs (from the two previous cells).
-    """
     def __init__(self, C_in=3, num_classes=10, init_channels=36, num_cells=20,
                  arch_normal=None, arch_reduce=None):
         super(DiscoveredNetwork, self).__init__()
@@ -731,9 +723,11 @@ class DiscoveredNetwork(nn.Module):
             nn.BatchNorm2d(init_channels),
         )
 
-        # Build cells: for each cell, pass in two external inputs
-        self.cells = nn.ModuleList()
-        # For the first cell, duplicate the stem output
+        # Build cells: for each cell, update the two previous outputs in a rolling fashion
+        s = self.stem(torch.zeros(1, C_in, 32, 32))  # dummy forward pass to get shape
+        s0 = s
+        s1 = s
+        cells = []
         c_prev = init_channels
         for i in range(num_cells):
             reduction = (i in [num_cells // 3, (2 * num_cells) // 3])
@@ -741,20 +735,22 @@ class DiscoveredNetwork(nn.Module):
                 cell = FinalCell(c_prev, init_channels, self.arch_reduce, reduction)
             else:
                 cell = FinalCell(c_prev, init_channels, self.arch_normal, reduction)
-            self.cells.append(cell)
+            cells.append(cell)
+            # We update c_prev to be the output channel count of the cell
             c_prev = cell.out_channels
-
+        self.cells = nn.ModuleList(cells)
         self.global_pooling = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Linear(c_prev, num_classes)
 
     def forward(self, x):
-        out = self.stem(x)
-        # For the first cell, duplicate the stem output as both external inputs
-        outs = [out, out]
+        s = self.stem(x)
+        # For the first cell, duplicate the stem output for both external inputs
+        s0 = s
+        s1 = s
         for cell in self.cells:
-            out = cell(outs[-2], outs[-1])
-            outs.append(out)
-        final_out = outs[-1]
+            out = cell(s0, s1)
+            s0, s1 = s1, out  # roll the outputs
+        final_out = s1
         final_out = self.global_pooling(final_out)
         logits = self.classifier(final_out.view(final_out.size(0), -1))
         return logits
@@ -777,9 +773,6 @@ def evaluate(model, loader, device):
 def train_final_model(arch_normal, arch_reduce, device='cuda',
                       lr=0.025, momentum=0.9, weight_decay=3e-4,
                       epochs=650, batch_size=96):
-    """
-    Train the discovered architecture from scratch on CIFAR-10.
-    """
     print("=== Training Final Discovered Architecture ===")
     train_loader, val_loader = get_cifar10_loaders(batch_size=batch_size, cutout_length=16)
     model = DiscoveredNetwork(C_in=3, num_classes=10, init_channels=36, num_cells=20,
