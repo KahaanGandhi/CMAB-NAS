@@ -168,13 +168,12 @@ class SepConv(nn.Module):
         return self.op(x)
 
 # ====== Mixed Cell (Proxy) for Weight-Sharing ======
+# A cell composed of 4 nodes.
+# Each node takes inputs from:
+#   - Two external cell inputs (indices -2 and -1)
+#   - All preceding node outputs (indices 0 to node_index-1)
 
 class MixedCell(nn.Module):
-    """
-    A cell composed of 4 nodes. Each node takes inputs from:
-    - Two external cell inputs (indices -2 and -1)
-    - All preceding node outputs (indices 0 to node_index-1)
-    """
     def __init__(self, c_in, c_out, reduction=False):
         super(MixedCell, self).__init__()
         self.reduction = reduction
@@ -202,14 +201,18 @@ class MixedCell(nn.Module):
         s0 = self.preprocess0(input_prev_prev)  # index -2
         s1 = self.preprocess1(input_prev)       # index -1
         node_outputs = []
-        # Helper function to select inputs by index
+        # Helper function to select inputs by index and force spatial dims to match s0
         def get_input(idx):
             if idx == -2:
-                return s0
+                x = s0
             elif idx == -1:
-                return s1
+                x = s1
             else:
-                return node_outputs[idx]
+                x = node_outputs[idx]
+            # Force x to have the same spatial dimensions as s0
+            if x.shape[2:] != s0.shape[2:]:
+                x = nn.functional.interpolate(x, size=s0.shape[2:], mode='bilinear', align_corners=False)
+            return x
         # For each of the 4 nodes, apply the operations as per arch
         for node_def in arch:
             (i1, op1), (i2, op2) = node_def
@@ -236,7 +239,8 @@ class MixedCell(nn.Module):
 # ====== Proxy Network with Two External Inputs per Cell ======
 # A weight-sharing network that stacks 8 cells.
 # For the first cell, the stem output is duplicated.
-# The network now updates the two previous cell outputs in a rolling fashion.
+# The network updates the two previous cell outputs in a rolling fashion.
+# For the very first cell, both external inputs become the cell's output.
 
 class ProxyNetwork(nn.Module):
     def __init__(self, C_in=3, num_classes=10, num_cells=8, init_channels=16):
@@ -252,7 +256,6 @@ class ProxyNetwork(nn.Module):
 
         # Build cells; reduction cells at indices 2 and 5
         self.cells = nn.ModuleList()
-        # For the first cell, c_in is init_channels; subsequent cells use the output channels of the previous cell
         c_prev = init_channels
         for i in range(num_cells):
             reduction = (i in [2, 5])
@@ -268,14 +271,20 @@ class ProxyNetwork(nn.Module):
         # For the first cell, duplicate the stem output for both external inputs
         s0 = s
         s1 = s
-        # For each cell, update s0 and s1 in a rolling manner
+        first_cell = True
         for cell in self.cells:
             if cell.reduction:
                 arch = arch_reduce if arch_reduce is not None else [((-2, 'skip_connect'), (-1, 'skip_connect'))] * cell.num_nodes
             else:
                 arch = arch_normal if arch_normal is not None else [((-2, 'skip_connect'), (-1, 'skip_connect'))] * cell.num_nodes
             out = cell(s0, s1, arch)
-            s0, s1 = s1, out  # roll the previous two outputs
+            if first_cell:
+                # For the first cell, update both external inputs to the cell's output
+                s0 = out
+                s1 = out
+                first_cell = False
+            else:
+                s0, s1 = s1, out  # roll the previous two outputs
         final_out = s1
         final_out = self.global_pooling(final_out)
         logits = self.classifier(final_out.view(final_out.size(0), -1))
@@ -537,7 +546,7 @@ class NMCSNAS:
         self.optimizer.step()
         return train_iter
 
-    def _eval_child_architecture(self, arch_n, arch_r, num_batches=2):
+    def _eval_child_architecture(self, arch_n, arch_r, num_batches=10):  # TODO: check latency tradeoff here
         self.proxy.eval()
         correct = 0
         total = 0
@@ -579,7 +588,7 @@ class NMCSNAS:
         total = 0
         val_iter = iter(self.val_loader)
         with torch.no_grad():
-            for _ in range(1):  # one batch for speed (as in the paper's intent for a quick evaluation)
+            for _ in range(10):  # TODO: check latency tradeoff here
                 try:
                     inputs, targets = next(val_iter)
                 except StopIteration:
@@ -683,13 +692,17 @@ class FinalCell(nn.Module):
         s0 = self.preprocess0(input_prev_prev)  # external input -2
         s1 = self.preprocess1(input_prev)       # external input -1
         node_outputs = []
+        # Helper function to select inputs by index and force spatial dims to match s0
         def get_input(idx):
             if idx == -2:
-                return s0
+                x = s0
             elif idx == -1:
-                return s1
+                x = s1
             else:
-                return node_outputs[idx]
+                x = node_outputs[idx]
+            if x.shape[2:] != s0.shape[2:]:
+                x = nn.functional.interpolate(x, size=s0.shape[2:], mode='bilinear', align_corners=False)
+            return x
         for (i1, op1), (i2, op2) in self.arch:
             x1 = get_input(i1)
             x2 = get_input(i2)
@@ -723,10 +736,11 @@ class DiscoveredNetwork(nn.Module):
             nn.BatchNorm2d(init_channels),
         )
 
-        # Build cells: for each cell, update the two previous outputs in a rolling fashion
-        s = self.stem(torch.zeros(1, C_in, 32, 32))  # dummy forward pass to get shape
+        # Build cells: update the two previous outputs in a rolling fashion
+        s = self.stem(torch.zeros(1, C_in, 32, 32))  # dummy forward to get shape
         s0 = s
         s1 = s
+        first_cell = True
         cells = []
         c_prev = init_channels
         for i in range(num_cells):
@@ -736,7 +750,14 @@ class DiscoveredNetwork(nn.Module):
             else:
                 cell = FinalCell(c_prev, init_channels, self.arch_normal, reduction)
             cells.append(cell)
-            # We update c_prev to be the output channel count of the cell
+            if first_cell:
+                # For first cell, update both external inputs to cell's output
+                s0 = cell(s0, s1)
+                s1 = s0
+                first_cell = False
+            else:
+                out = cell(s0, s1)
+                s0, s1 = s1, out
             c_prev = cell.out_channels
         self.cells = nn.ModuleList(cells)
         self.global_pooling = nn.AdaptiveAvgPool2d(1)
@@ -744,12 +765,17 @@ class DiscoveredNetwork(nn.Module):
 
     def forward(self, x):
         s = self.stem(x)
-        # For the first cell, duplicate the stem output for both external inputs
         s0 = s
         s1 = s
+        first_cell = True
         for cell in self.cells:
             out = cell(s0, s1)
-            s0, s1 = s1, out  # roll the outputs
+            if first_cell:
+                s0 = out
+                s1 = out
+                first_cell = False
+            else:
+                s0, s1 = s1, out
         final_out = s1
         final_out = self.global_pooling(final_out)
         logits = self.classifier(final_out.view(final_out.size(0), -1))
