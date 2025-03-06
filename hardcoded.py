@@ -773,5 +773,6 @@ def main():
     total_runtime = end_time - start_time
     print(f"Total script runtime: {total_runtime:.2f} seconds")
 
+# TODO: fix this later, training loop is cooked
 if __name__ == "__main__":
     main()
